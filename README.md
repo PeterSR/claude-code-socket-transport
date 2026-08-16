@@ -283,6 +283,40 @@ a different sender.
   drops identical repeats arriving close together, and caps undelivered accepted
   messages at 50 per session.
 
+## Prior art
+
+Several projects connect Claude Code sessions to each other. As far as I can
+tell none of them speak Claude Code's own inbox socket: each builds a parallel
+transport alongside it and needs cooperating code running inside every session.
+That is the difference in one line. This package talks to a stock session that
+knows nothing about it, which is what lets a program that is not Claude, and
+was never launched by Claude, get a message in front of one.
+
+- [yilunzhang/claude-code-inter-session](https://github.com/yilunzhang/claude-code-inter-session)
+  (Python) runs a local WebSocket bus and delivers over Claude Code's `Monitor`
+  tool, so latency is milliseconds with no polling. Every participating session
+  has to connect to the bus.
+- [PatilShreyas/claude-code-session-bridge](https://github.com/PatilShreyas/claude-code-session-bridge)
+  (Shell) is a Claude Code plugin that passes messages through files under
+  `~/.claude/session-bridge/`, with a listen script polling every three seconds.
+  It is built for a request-and-answer exchange between two repos.
+- [Jesse-njx/dsh-crosstalk](https://github.com/Jesse-njx/dsh-crosstalk)
+  (TypeScript) is not for Claude Code at all. It ports the `ListAgents` and
+  `SendMessage` model onto another harness, over a heartbeat registry of files.
+  Useful as a second reading of the same design.
+
+On the Go side, [lancekrogers/claude-code-go](https://github.com/lancekrogers/claude-code-go)
+and [ProjAnvil/claude-agent-sdk-golang](https://github.com/ProjAnvil/claude-agent-sdk-golang)
+are SDKs for launching and driving Claude from Go. They start a session and own
+it. This package does the opposite: it addresses a session someone else already
+started and is sitting in front of.
+
+The feature itself is
+[documented by Anthropic](https://code.claude.com/docs/en/cross-session-messaging),
+including the fact that a script can post to a session's socket. The frame
+format, the registry files, and the auth-key layout are not documented; that
+part is read out of the binary.
+
 ## Stability
 
 The wire format, the registry files, and the key-file layout are Claude Code
