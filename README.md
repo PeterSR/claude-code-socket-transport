@@ -68,21 +68,35 @@ two live candidates.
 `FindByPID` trusts the registry: whatever is registered under that PID comes
 back, even though a PID can be recycled onto an unrelated process once the
 session that owned it exits. A caller that keeps its own long-lived record of
-sessions, such as a `(sessionID, pid)` pair from an earlier lookup, should use
-`FindByPIDForSession` instead, which returns the entry only when it still
-carries the session ID expected:
+sessions should verify the entry before trusting it, and which key to verify on
+depends on where the record came from.
+
+If you hold a session ID that came from the session itself, such as a hook
+reading it out of its own environment, verify on that:
 
 ```go
 s, err := ccsock.FindByPIDForSession(4242, "0dd4b9a6-0000-4000-8000-000000000000")
 // err wraps ErrNotFound if pid 4242 is now a different session, or none at all
 ```
 
-`Session.Verify` is that check by itself, a pure comparison against
-`Session.SessionID` that proves nothing about liveness; `Running` and
-`Reachable` are for that. `ProcessStartToken` exposes the platform-specific
-process-start token this package compares `Session.ProcStart` against
-internally, for a caller that wants to corroborate a PID the same way rather
-than trust the registry file alone.
+If you hold a session ID from a registry of your own, verify on the process
+instead:
+
+```go
+tok, _ := ccsock.ProcessStartToken(4242)         // when you first record it
+s, err := ccsock.FindByPIDForProcess(4242, tok)  // when you come back to it
+```
+
+The difference matters. A `/clear` mints a fresh session ID for a session that
+keeps running, and Claude Code writes the new one to its registry immediately,
+so an ID you recorded earlier can disagree with the registry for a session that
+is alive and reachable. Verifying on the session ID would refuse to deliver to
+it. The process start token does not drift that way: it is stable for the life
+of the process, which is exactly the property a cross-registry join key needs.
+
+`Session.Verify` and `Session.MatchesProcess` are those two checks by
+themselves, pure comparisons that prove nothing about liveness; `Running` and
+`Reachable` are for that.
 
 ### Send
 
@@ -311,6 +325,13 @@ change. The fields this package models are on `Session`; the rest stay in
 `Session.Raw`. The file is written by the session, so it can describe a process
 that has since exited. `Running` checks the PID and `Reachable` connects to the
 socket, which is the check Claude Code itself trusts.
+
+`sessionId` is the session's current ID, not a stable identifier for the
+process: a `/clear` mints a new one and the session rewrites the file with it,
+while the PID and `procStart` stay put. It is the field that looks like an
+identity, so it is the one an external registry reaches for first, and the
+breakage only shows up once somebody clears a long-running session. Key a
+cross-registry join on `procStart` instead; see `FindByPIDForProcess`.
 
 ### Attribution envelope
 

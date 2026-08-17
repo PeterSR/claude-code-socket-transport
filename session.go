@@ -275,6 +275,39 @@ func FindByPIDForSession(pid int, sessionID string) (Session, error) {
 	return s, nil
 }
 
+// MatchesProcess reports whether this entry belongs to the process that
+// produced procStart, a token from ProcessStartToken. An empty argument never
+// matches, and neither does an entry whose own ProcStart is empty.
+//
+// This is the join key to use when correlating against a registry of your own.
+// A session's registry file carries its current session ID, which a /clear
+// replaces while the process keeps running, so a caller that remembered a
+// (pid, session id) pair can find them disagreeing for a session that is
+// running and reachable. The start token is stable for the life of the
+// process, so it does not drift that way.
+func (s Session) MatchesProcess(procStart string) bool {
+	return procStart != "" && s.ProcStart == procStart
+}
+
+// FindByPIDForProcess is FindByPID for a caller who remembered a
+// (pid, process start token) pair: it returns the session registered under pid
+// only when MatchesProcess confirms the PID has not been recycled onto an
+// unrelated process since.
+//
+// Prefer this over FindByPIDForSession when the session ID you hold came from
+// your own records rather than from the session itself, since a /clear changes
+// the session's ID without changing its process. See MatchesProcess.
+func FindByPIDForProcess(pid int, procStart string) (Session, error) {
+	s, err := FindByPID(pid)
+	if err != nil {
+		return Session{}, err
+	}
+	if !s.MatchesProcess(procStart) {
+		return Session{}, fmt.Errorf("%w with pid %d: entry belongs to a different process", ErrNotFound, pid)
+	}
+	return s, nil
+}
+
 // FindBySessionID returns the registered session with the given session UUID.
 //
 // A session ID survives a resume onto a new PID, so more than one registry

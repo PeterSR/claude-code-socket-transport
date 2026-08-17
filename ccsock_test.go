@@ -1008,3 +1008,98 @@ func TestPackageLookupKeepsDefaultProbeTimeout(t *testing.T) {
 		}
 	}
 }
+
+func TestMatchesProcess(t *testing.T) {
+	cases := []struct {
+		name  string
+		entry string
+		arg   string
+		want  bool
+	}{
+		{"match", "134433429", "134433429", true},
+		{"mismatch", "134433429", "181436777", false},
+		{"empty argument never matches", "134433429", "", false},
+		{"empty entry never matches", "", "134433429", false},
+		{"both empty", "", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := Session{ProcStart: c.entry}
+			if got := s.MatchesProcess(c.arg); got != c.want {
+				t.Errorf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// writeSessionWithProcStart writes a registry entry carrying a start token,
+// which writeSession leaves out.
+func writeSessionWithProcStart(t *testing.T, dir string, pid int, sessionID, procStart string) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"sessionId":           sessionID,
+		"messagingSocketPath": filepath.Join(t.TempDir(), "s.sock"),
+		"procStart":           procStart,
+		"startedAt":           float64(1000),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%d.json", pid)), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFindByPIDForProcess(t *testing.T) {
+	cfg := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", cfg)
+	sessions := filepath.Join(cfg, "sessions")
+	if err := os.MkdirAll(sessions, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeSessionWithProcStart(t, sessions, 4242, "sid-now", "134433429")
+
+	got, err := FindByPIDForProcess(4242, "134433429")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PID != 4242 {
+		t.Errorf("got pid %d, want 4242", got.PID)
+	}
+
+	if _, err := FindByPIDForProcess(4242, "181436777"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("recycled pid: got %v, want ErrNotFound", err)
+	}
+	if _, err := FindByPIDForProcess(9999, "134433429"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown pid: got %v, want ErrNotFound", err)
+	}
+}
+
+// TestFindByPIDForSessionSurvivesClear pins the reason both verified lookups
+// exist: a /clear replaces the session id in the registry while the process
+// keeps running, so an id recorded before it no longer verifies, while the
+// process start token still does.
+func TestFindByPIDForSessionSurvivesClear(t *testing.T) {
+	cfg := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", cfg)
+	sessions := filepath.Join(cfg, "sessions")
+	if err := os.MkdirAll(sessions, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const recordedID, recordedProcStart = "sid-before-clear", "134433429"
+	writeSessionWithProcStart(t, sessions, 4242, recordedID, recordedProcStart)
+
+	if _, err := FindByPIDForSession(4242, recordedID); err != nil {
+		t.Fatalf("before the clear: %v", err)
+	}
+
+	// The session clears: same process, same start token, new session id.
+	writeSessionWithProcStart(t, sessions, 4242, "sid-after-clear", recordedProcStart)
+
+	if _, err := FindByPIDForSession(4242, recordedID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("session id lookup: got %v, want ErrNotFound", err)
+	}
+	if _, err := FindByPIDForProcess(4242, recordedProcStart); err != nil {
+		t.Errorf("process lookup should still find it, got %v", err)
+	}
+}
