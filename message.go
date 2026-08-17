@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Priority controls where a message lands in the receiving session's input
@@ -111,6 +112,10 @@ func (m Message) frame() (userFrame, error) {
 		return userFrame{}, fmt.Errorf("ccsock: unknown priority %q", priority)
 	}
 
+	if m.From != "" && !validAddress(m.From) {
+		return userFrame{}, fmt.Errorf("ccsock: message From %q is not a well-formed uds: address", m.From)
+	}
+
 	msgID := m.MsgID
 	if msgID == "" {
 		id, err := newUUID()
@@ -135,6 +140,35 @@ func (m Message) frame() (userFrame, error) {
 		SessionID: m.SessionID,
 		UUID:      m.UUID,
 	}, nil
+}
+
+// validAddress reports whether addr is a well-formed "uds:" address: the
+// receiver's own parse would otherwise be fed whatever %q-escaping wrapEnvelope
+// produces for a From containing a quote or newline, and its envelope
+// round-trip comparison would silently drop the attribution.
+func validAddress(addr string) bool {
+	if !strings.HasPrefix(addr, "uds:") {
+		return false
+	}
+	for i := len("uds:"); i < len(addr); i++ {
+		b := addr[i]
+		if addrSafe(b) {
+			continue
+		}
+		// Address percent-encodes everything else, so the only other byte a
+		// well-formed address can carry is a % introducing two hex digits.
+		if b != '%' || i+2 >= len(addr) {
+			return false
+		}
+		if _, ok := unhex(addr[i+1]); !ok {
+			return false
+		}
+		if _, ok := unhex(addr[i+2]); !ok {
+			return false
+		}
+		i += 2
+	}
+	return true
 }
 
 // envelopeTag is the element Claude Code wraps peer message text in so the
@@ -172,7 +206,19 @@ func sanitizeName(name string) string {
 	}, name)
 	name = strings.TrimSpace(name)
 	if len(name) > maxFromName {
-		name = strings.TrimSpace(name[:maxFromName])
+		// Cut on a rune boundary: name[:maxFromName] is a raw byte slice and
+		// can land inside a multi-byte rune, which makes json.Marshal emit
+		// U+FFFD on the wire. Keep the limit in bytes rather than runes:
+		// Claude Code truncates at 200 UTF-16 code units, and a UTF-8 byte
+		// count is always >= the UTF-16 unit count for the same text, so a
+		// 200-byte cut can only ever be more aggressive than the receiver's
+		// own truncation, which its envelope round-trip comparison tolerates.
+		// Cutting less would not.
+		cut := maxFromName
+		for cut > 0 && !utf8.RuneStart(name[cut]) {
+			cut--
+		}
+		name = strings.TrimSpace(name[:cut])
 	}
 	return name
 }

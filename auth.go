@@ -4,13 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 )
 
 // maxKeyFileBytes matches the cap Claude Code applies when reading an inbox
@@ -102,15 +102,11 @@ func LookupToken(socketPath string) (string, error) {
 }
 
 func readKeyFile(path string) (keyFile, error) {
-	fi, err := os.Lstat(path)
+	data, err := readSmallFile(path, maxKeyFileBytes)
 	if err != nil {
-		return keyFile{}, err
-	}
-	if !fi.Mode().IsRegular() || fi.Size() > maxKeyFileBytes {
-		return keyFile{}, fmt.Errorf("%s is not a readable key file", path)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
+		if errors.Is(err, errNotSmallFile) {
+			return keyFile{}, fmt.Errorf("%s is not a readable key file", path)
+		}
 		return keyFile{}, err
 	}
 	var kf keyFile
@@ -126,7 +122,7 @@ func readKeyFile(path string) (keyFile, error) {
 // rankKeyOwner scores how much a key file's owning process corroborates it:
 // 2 alive with a matching start token, 1 alive but unverifiable, 0 gone.
 func rankKeyOwner(pid int, procStart string) int {
-	if pid <= 1 || syscall.Kill(pid, 0) != nil {
+	if pid <= 1 || !processAlive(pid) {
 		return 0
 	}
 	if procStart == "" {

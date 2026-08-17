@@ -4,12 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
-	"syscall"
 	"time"
 )
 
@@ -83,6 +83,20 @@ func (s Session) Address() string {
 	return Address(s.SocketPath)
 }
 
+// Verify reports whether this entry is really the session with the given
+// ID. A registry entry is keyed by PID, and a PID can be recycled, so a
+// caller holding a remembered (pid, session id) pair should confirm the
+// entry still carries the session it expects before sending to it.
+//
+// Verify is a pure comparison against SessionID: it does not check
+// liveness, which is what Running and Reachable are for.
+func (s Session) Verify(sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	return s.SessionID == sessionID
+}
+
 // Running reports whether the registered PID still exists. It does not prove
 // the process is still Claude Code: a PID can be recycled. Reachable is the
 // stronger check.
@@ -90,7 +104,7 @@ func (s Session) Running() bool {
 	if s.PID <= 1 {
 		return false
 	}
-	return syscall.Kill(s.PID, 0) == nil
+	return processAlive(s.PID)
 }
 
 // Reachable reports whether the session's inbox socket accepts a connection.
@@ -146,15 +160,11 @@ func ListSessions() ([]Session, error) {
 }
 
 func readSessionFile(path string, pid int) (Session, error) {
-	fi, err := os.Lstat(path)
+	data, err := readSmallFile(path, maxRegistryFileBytes)
 	if err != nil {
-		return Session{}, err
-	}
-	if !fi.Mode().IsRegular() || fi.Size() > maxRegistryFileBytes {
-		return Session{}, fmt.Errorf("%s is not a readable registry file", path)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
+		if errors.Is(err, errNotSmallFile) {
+			return Session{}, fmt.Errorf("%s is not a readable registry file", path)
+		}
 		return Session{}, err
 	}
 	var raw map[string]any
@@ -184,6 +194,30 @@ func readSessionFile(path string, pid int) (Session, error) {
 		File:            path,
 		Raw:             raw,
 	}, nil
+}
+
+// errNotSmallFile marks a path that failed readSmallFile's regular-file-and-
+// size check, so callers can attach their own wording to the failure.
+var errNotSmallFile = errors.New("not a readable file")
+
+// readSmallFile opens path without following a symlink, then stats the
+// already-open file descriptor before reading it, so a path swapped for a
+// symlink between check and read cannot be followed: Lstat-then-ReadFile is
+// non-atomic and would still follow it.
+func readSmallFile(path string, max int64) ([]byte, error) {
+	f, err := openNoFollow(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() || fi.Size() > max {
+		return nil, errNotSmallFile
+	}
+	return io.ReadAll(io.LimitReader(f, max))
 }
 
 func str(m map[string]any, k string) string {
@@ -225,12 +259,34 @@ func FindByPID(pid int) (Session, error) {
 	return Session{}, fmt.Errorf("%w with pid %d", ErrNotFound, pid)
 }
 
+// FindByPIDForSession is the safe form of FindByPID for a caller who
+// remembered a (pid, session id) pair rather than just a pid: it returns the
+// session registered under pid only when that entry's Verify(sessionID)
+// confirms it still carries the expected session id, so a PID recycled onto
+// an unrelated process cannot be mistaken for the session the caller meant.
+func FindByPIDForSession(pid int, sessionID string) (Session, error) {
+	s, err := FindByPID(pid)
+	if err != nil {
+		return Session{}, err
+	}
+	if !s.Verify(sessionID) {
+		return Session{}, fmt.Errorf("%w with pid %d: entry carries a different session id", ErrNotFound, pid)
+	}
+	return s, nil
+}
+
 // FindBySessionID returns the registered session with the given session UUID.
 //
 // A session ID survives a resume onto a new PID, so more than one registry
 // entry can carry it. When several match, the reachable one wins; if several
 // are reachable, FindBySessionID returns ErrAmbiguous.
 func FindBySessionID(sessionID string) (Session, error) {
+	return findBySessionID(sessionID, defaultProbeTimeout)
+}
+
+// findBySessionID is FindBySessionID with the reachability probe timeout as a
+// parameter, so Client can apply its own.
+func findBySessionID(sessionID string, probe time.Duration) (Session, error) {
 	if sessionID == "" {
 		return Session{}, fmt.Errorf("%w: empty session id", ErrNotFound)
 	}
@@ -244,13 +300,19 @@ func FindBySessionID(sessionID string) (Session, error) {
 			matches = append(matches, s)
 		}
 	}
-	return pickOne(matches, fmt.Sprintf("session id %s", sessionID))
+	return pickOne(matches, fmt.Sprintf("session id %s", sessionID), probe)
 }
 
 // FindByName returns the session answering to a name. Names are not unique
 // across sessions; when several live sessions share one, FindByName returns
 // ErrAmbiguous and the caller should pick from ListSessions itself.
 func FindByName(name string) (Session, error) {
+	return findByName(name, defaultProbeTimeout)
+}
+
+// findByName is FindByName with the reachability probe timeout as a parameter,
+// so Client can apply its own.
+func findByName(name string, probe time.Duration) (Session, error) {
 	if name == "" {
 		return Session{}, fmt.Errorf("%w: empty name", ErrNotFound)
 	}
@@ -264,10 +326,16 @@ func FindByName(name string) (Session, error) {
 			matches = append(matches, s)
 		}
 	}
-	return pickOne(matches, fmt.Sprintf("name %q", name))
+	return pickOne(matches, fmt.Sprintf("name %q", name), probe)
 }
 
-func pickOne(matches []Session, what string) (Session, error) {
+// reachableFunc is the reachability check pickOne applies. Production always
+// uses Session.Reachable; it is a variable so a test can observe the timeout
+// that actually reaches the probe, which is the one thing a caller setting
+// Client.ProbeTimeout is paying for.
+var reachableFunc = Session.Reachable
+
+func pickOne(matches []Session, what string, probe time.Duration) (Session, error) {
 	switch len(matches) {
 	case 0:
 		return Session{}, fmt.Errorf("%w for %s", ErrNotFound, what)
@@ -276,7 +344,7 @@ func pickOne(matches []Session, what string) (Session, error) {
 	}
 	var live []Session
 	for _, s := range matches {
-		if s.Reachable(defaultProbeTimeout) {
+		if reachableFunc(s, probe) {
 			live = append(live, s)
 		}
 	}

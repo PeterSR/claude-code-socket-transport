@@ -65,6 +65,29 @@ func DefaultSocketPath(pid int) string {
 	return filepath.Join(fallback, fmt.Sprintf("cc-socks-%d", os.Getuid()), fmt.Sprintf("%d.sock", pid))
 }
 
+// ensureSocketDir creates dir if needed and verifies it is safe to bind a
+// socket into. os.MkdirAll is a no-op when the directory already exists, so
+// without this check an attacker who pre-creates a world-writable socket
+// directory before we ever run would have it bound into silently. Refusing
+// is deliberate: erroring out here is better than binding into a directory
+// someone else can write.
+func ensureSocketDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("ccsock: creating %s: %w", dir, err)
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("ccsock: checking %s: %w", dir, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("ccsock: %s is a symlink, refusing to bind into it", dir)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("ccsock: %s is not a directory", dir)
+	}
+	return checkSocketDirOwnership(dir, fi)
+}
+
 // canonicalSocketPath normalizes a socket path the same way Claude Code does
 // before hashing it into an auth-key filename. Paths containing a ".." segment
 // are refused rather than cleaned, matching Claude Code's own refusal.

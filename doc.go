@@ -20,4 +20,8 @@
 //
 // Discovery, auth-token lookup, and the wire encoding are handled for you.
 // See Client for the configurable form, and Inbox if you want delivery receipts.
+//
+// The package builds under GOOS=windows for sending only. Listen refuses there,
+// because the standard library gives no way to verify that the socket directory
+// is one only you can write.
 package ccsock

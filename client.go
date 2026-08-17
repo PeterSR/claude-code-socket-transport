@@ -87,9 +87,11 @@ func (c *Client) SendToPID(ctx context.Context, pid int, m Message) (string, err
 }
 
 // SendToSessionID delivers a message to the session with the given session
-// UUID.
+// UUID. Liveness among several matching entries is resolved with c's
+// ProbeTimeout, not the package default, so a slow filesystem does not get a
+// live session reported stale out from under a caller who raised it.
 func (c *Client) SendToSessionID(ctx context.Context, sessionID string, m Message) (string, error) {
-	s, err := FindBySessionID(sessionID)
+	s, err := findBySessionID(sessionID, c.probeTimeout())
 	if err != nil {
 		return "", err
 	}
@@ -97,8 +99,10 @@ func (c *Client) SendToSessionID(ctx context.Context, sessionID string, m Messag
 }
 
 // SendToName delivers a message to the session answering to a name.
+// Liveness among several matching entries is resolved with c's ProbeTimeout;
+// see SendToSessionID.
 func (c *Client) SendToName(ctx context.Context, name string, m Message) (string, error) {
-	s, err := FindByName(name)
+	s, err := findByName(name, c.probeTimeout())
 	if err != nil {
 		return "", err
 	}
@@ -136,6 +140,22 @@ func (c *Client) SendToSocket(ctx context.Context, socketPath string, m Message)
 // Rename asks a session to change the name it answers to. The session applies
 // it without prompting, so use it only on sessions you own.
 func (c *Client) Rename(ctx context.Context, socketPath, name string) error {
+	return c.rename(ctx, socketPath, "", name)
+}
+
+// RenameSession is Rename addressed to a known session, stamping the
+// session ID so a stale registry entry cannot rename whatever now
+// listens on that path.
+func (c *Client) RenameSession(ctx context.Context, s Session, name string) error {
+	if s.SocketPath == "" {
+		return fmt.Errorf("ccsock: session %d has no inbox socket", s.PID)
+	}
+	return c.rename(ctx, s.SocketPath, s.SessionID, name)
+}
+
+// rename builds and sends the rename control frame shared by Rename and
+// RenameSession.
+func (c *Client) rename(ctx context.Context, socketPath, sessionID, name string) error {
 	if name == "" {
 		return fmt.Errorf("ccsock: rename needs a non-empty name")
 	}
@@ -144,11 +164,12 @@ func (c *Client) Rename(ctx context.Context, socketPath, name string) error {
 		return err
 	}
 	return c.writeFrame(ctx, socketPath, controlFrame{
-		MsgV:   protocolVersion,
-		MsgID:  msgID,
-		Type:   "control",
-		Action: "rename",
-		Name:   name,
+		MsgV:      protocolVersion,
+		MsgID:     msgID,
+		Type:      "control",
+		Action:    "rename",
+		Name:      name,
+		SessionID: sessionID,
 	})
 }
 
@@ -201,8 +222,14 @@ func (c *Client) writeFrame(ctx context.Context, socketPath string, frame any) e
 	}
 	if runtime.GOOS == "darwin" {
 		// Claude Code delays its own half-close on macOS, where closing
-		// immediately after a write can cost the receiver the last frame.
-		time.Sleep(150 * time.Millisecond)
+		// immediately after a write can cost the receiver the last frame. A
+		// bare time.Sleep here would ignore both context cancellation and the
+		// send deadline, so wait on whichever comes first instead.
+		select {
+		case <-time.After(150 * time.Millisecond):
+		case <-ctx.Done():
+			return fmt.Errorf("ccsock: sending to %s: %w", socketPath, ctx.Err())
+		}
 	}
 	if err := unix.CloseWrite(); err != nil {
 		return fmt.Errorf("ccsock: half-closing %s: %w", socketPath, err)

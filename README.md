@@ -30,7 +30,10 @@ messaging exists from Claude Code v2.1.224, which is the floor for a session to
 bind an inbox at all. The protocol implemented here was read out of v2.1.233
 and verified against it; earlier versions in that range are untested. Runs on
 macOS and Linux, including WSL 2. Native Windows has no cross-session
-messaging.
+messaging. The package itself still builds under `GOOS=windows`, for a caller
+that only sends; `Listen` refuses there outright, since Windows has no
+standard-library way to verify the socket directory's ownership, and binding
+without that guarantee would defeat the point of the check.
 
 ## Install
 
@@ -59,6 +62,27 @@ for _, s := range sessions {
 session ID survives a resume onto a new PID and names are not unique, so both
 prefer the reachable entry and return `ErrAmbiguous` rather than guess between
 two live candidates.
+
+### Verifying a remembered PID
+
+`FindByPID` trusts the registry: whatever is registered under that PID comes
+back, even though a PID can be recycled onto an unrelated process once the
+session that owned it exits. A caller that keeps its own long-lived record of
+sessions, such as a `(sessionID, pid)` pair from an earlier lookup, should use
+`FindByPIDForSession` instead, which returns the entry only when it still
+carries the session ID expected:
+
+```go
+s, err := ccsock.FindByPIDForSession(4242, "0dd4b9a6-0000-4000-8000-000000000000")
+// err wraps ErrNotFound if pid 4242 is now a different session, or none at all
+```
+
+`Session.Verify` is that check by itself, a pure comparison against
+`Session.SessionID` that proves nothing about liveness; `Running` and
+`Reachable` are for that. `ProcessStartToken` exposes the platform-specific
+process-start token this package compares `Session.ProcStart` against
+internally, for a caller that wants to corroborate a PID the same way rather
+than trust the registry file alone.
 
 ### Send
 
@@ -91,9 +115,10 @@ synchronously, because the answer arrives later on a separate connection. If
 you need it, give the message a return address and listen:
 
 ```go
-inbox, _ := ccsock.Listen()
+inbox, _ := ccsock.Listen(ccsock.InboxConfig{
+    OnReceipt: func(r ccsock.Receipt) { log.Println(r.OrigMsgID, r.Status) },
+})
 defer inbox.Close()
-inbox.OnReceipt = func(r ccsock.Receipt) { log.Println(r.OrigMsgID, r.Status) }
 
 msgID, err := client.SendToPID(ctx, 4242, ccsock.Message{Text: "build is green", From: inbox.Address()})
 ```
@@ -109,7 +134,9 @@ unnamed peer.
 
 Set `Message.From` to a reply address so the receiving Claude can answer. Inside
 a Claude Code session, `SelfAddress()` returns the right value. From a standalone
-program, an `Inbox` provides one.
+program, an `Inbox` provides one. `From` must be a well-formed `uds:` address;
+a send with anything else, such as a bare filesystem path, fails before it
+reaches the socket. `Address` renders a socket path into that form.
 
 ### Receipts
 
@@ -119,11 +146,12 @@ over the same protocol when it holds, denies, expires, or later delivers your
 message.
 
 ```go
-inbox, err := ccsock.Listen()
+inbox, err := ccsock.Listen(ccsock.InboxConfig{
+    OnReceipt: func(r ccsock.Receipt) {
+        log.Printf("%s: %s (%s)", r.OrigMsgID, r.Status, r.Reason)
+    },
+})
 defer inbox.Close()
-inbox.OnReceipt = func(r ccsock.Receipt) {
-    log.Printf("%s: %s (%s)", r.OrigMsgID, r.Status, r.Reason)
-}
 
 msgID, err := client.SendToName(ctx, "api-worker", ccsock.Message{
     Text: "deploy finished",
@@ -131,10 +159,18 @@ msgID, err := client.SendToName(ctx, "api-worker", ccsock.Message{
 })
 ```
 
+Callbacks are set through `InboxConfig` and passed to `Listen`, not assigned on
+the `Inbox` afterward: they run on the connection goroutine as frames arrive, so
+wiring them up after `Listen` returns would race the accept loop. `OnMessage` is
+optional; leave it nil if you only care about receipts.
+
 An `Inbox` is passive. It is not a Claude Code session: it does not register
 itself, and it will not appear in another session's agent list. A receiving
 session only sends receipts to an address inside its own socket namespace, which
 is why `Listen` binds beside the real sockets rather than anywhere you like.
+For the same reason, `Listen` refuses to bind at all when that directory is not
+one we own with no group or world access, since anything looser would let
+another local user replace the socket and forge receipts.
 
 ### CLI
 
@@ -156,6 +192,20 @@ go build ./cmd/cc-send
 
 `send` prints the bare message ID on stdout and nothing else, so it pipes.
 
+Flags have to come before the message text; anything after them is joined into
+the text verbatim, so a message that starts with a dash needs `--` to stop flag
+parsing: `cc-send send --pid 4242 -- "-starts-with-a-dash"`.
+
+`send`'s exit code tells a script what happened, not just whether the process
+ran:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Sent, and, with `--wait-receipt`, delivered or acknowledged |
+| 1 | Usage error or send failure |
+| 2 | The receiving session denied the message, or a held message expired |
+| 3 | `--wait-receipt` elapsed with no terminal receipt |
+
 ## The protocol
 
 Everything below is reverse-engineered from the Claude Code binary (v2.1.233)
@@ -164,12 +214,15 @@ change in any release.
 
 ### The socket
 
-Each session binds `$XDG_RUNTIME_DIR/cc-socks/<pid>.sock`, mode `0600`, in a
-directory it insists is `0700` and owned by you. If that path would exceed 103
-bytes it falls back to `/tmp/cc-socks-<uid>/<pid>.sock`, or to `$PREFIX/tmp`
-under Termux. A session exports its
-own path as `CLAUDE_CODE_MESSAGING_SOCKET` to hooks and Bash commands, and shows
-it in `/status` as `Peer address`, prefixed `uds:`.
+Each session binds `<base>/cc-socks/<pid>.sock`, mode `0600`, in a directory it
+insists is `0700` and owned by you; this package's own `Listen` checks the same
+thing before it binds, and refuses rather than accepting a looser directory.
+`<base>` is `$XDG_RUNTIME_DIR`, or `$CLAUDE_CODE_TMPDIR` when that is unset, or
+the system temp directory when neither is. If the resulting path would exceed
+103 bytes it falls back instead to `/tmp/cc-socks-<uid>/<pid>.sock`, or to
+`$PREFIX/tmp` under Termux. A session exports its own path as
+`CLAUDE_CODE_MESSAGING_SOCKET` to hooks and Bash commands, and shows it in
+`/status` as `Peer address`, prefixed `uds:`.
 
 In a `uds:` address every byte outside `A-Za-z0-9:_/.\-` is percent-encoded.
 
@@ -236,7 +289,11 @@ absolute socket path; a path containing a `..` segment is refused rather than
 cleaned. `procStart` is field 22 of `/proc/<pid>/stat` on Linux and the `ps
 -o lstart=` string on macOS, and it separates a live owner from a recycled PID.
 `LookupToken` reads that file; when several name the same socket it ranks them
-the way Claude Code does and takes the best-corroborated one.
+the way Claude Code does and takes the best-corroborated one. `ProcessStartToken`
+exposes the same platform-specific computation for a caller building its own
+comparable record, such as a `(pid, procStart)` pair to check a PID against
+later; it errors on a platform, such as Windows, where the token cannot be
+read.
 
 A process posting to *its own* session's socket instead uses the token it was
 handed in `CLAUDE_CODE_MESSAGING_TOKEN`, which identifies it as that session's

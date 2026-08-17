@@ -15,16 +15,33 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
 	ccsock "github.com/PeterSR/claude-code-socket-transport"
 )
 
+// exitError marks a run error with the process exit code it should produce,
+// so a script driving cc-send can tell a denied or expired receipt apart from
+// a plain send failure, and a receipt timeout apart from both.
+type exitError struct {
+	code int
+	err  error
+}
+
+func (e *exitError) Error() string { return e.err.Error() }
+func (e *exitError) Unwrap() error { return e.err }
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "cc-send:", err)
-		os.Exit(1)
+		code := 1
+		var ee *exitError
+		if errors.As(err, &ee) {
+			code = ee.code
+		}
+		os.Exit(code)
 	}
 }
 
@@ -61,11 +78,22 @@ func usage() {
 send flags:
   --priority now|next|later   queue placement (default next)
   --name-as <name>            attribute the message to this sender name
-  --from <uds-addr>           reply address to put on the message
+  --from <uds-addr>           reply address to put on the message; a bare
+                              socket path is accepted too
   --wait-receipt <duration>   bind a temporary inbox, set --from to it, and
                               report delivery receipts for this long
   --no-auth                   send without an auth frame
   --timeout <duration>        send timeout (default 5s)
+
+flags must come before the message text. Use -- to end flag parsing so a
+message that starts with a dash is not read as one:
+  cc-send send --pid 1234 -- "-starts-with-a-dash"
+
+send exit codes:
+  0   sent, and, with --wait-receipt, delivered or acknowledged
+  1   usage error or send failure
+  2   the receiving session denied the message, or a held message expired
+  3   --wait-receipt elapsed with no terminal receipt
 `)
 }
 
@@ -82,6 +110,20 @@ func listCmd(args []string) error {
 		return err
 	}
 
+	// Probe every session's socket in parallel: run serially, twenty stale
+	// entries at 300ms each cost six seconds. Each goroutine owns a distinct
+	// slice index, so no shared-slice append or lock is needed.
+	live := make([]bool, len(sessions))
+	var wg sync.WaitGroup
+	for i, s := range sessions {
+		wg.Add(1)
+		go func(i int, s ccsock.Session) {
+			defer wg.Done()
+			live[i] = s.Reachable(300 * time.Millisecond)
+		}(i, s)
+	}
+	wg.Wait()
+
 	type row struct {
 		PID       int    `json:"pid"`
 		SessionID string `json:"sessionId"`
@@ -94,15 +136,14 @@ func listCmd(args []string) error {
 		Live      bool   `json:"live"`
 	}
 	rows := make([]row, 0, len(sessions))
-	for _, s := range sessions {
-		live := s.Reachable(300 * time.Millisecond)
-		if !live && !*all {
+	for i, s := range sessions {
+		if !live[i] && !*all {
 			continue
 		}
 		rows = append(rows, row{
 			PID: s.PID, SessionID: s.SessionID, Name: s.Name, Kind: s.Kind,
 			Status: s.Status, CWD: s.CWD, Socket: s.SocketPath,
-			Address: s.Address(), Live: live,
+			Address: s.Address(), Live: live[i],
 		})
 	}
 
@@ -161,19 +202,37 @@ func sendCmd(args []string) error {
 		Text:     text,
 		Priority: ccsock.Priority(*priority),
 		FromName: *nameAs,
-		From:     *from,
+	}
+	if *from != "" {
+		// Message.From must be a well-formed uds: address now, but the CLI
+		// stays lenient: ParseAddress accepts a bare socket path too, and
+		// Address re-renders whichever form the user gave us.
+		p, err := ccsock.ParseAddress(*from)
+		if err != nil {
+			return fmt.Errorf("--from: %w", err)
+		}
+		msg.From = ccsock.Address(p)
 	}
 
 	var inbox *ccsock.Inbox
-	receipts := make(chan ccsock.Receipt, 8)
+	// Buffered and drained with a non-blocking send below: OnReceipt runs on
+	// the inbox's connection goroutine, so a full channel must never block it.
+	receipts := make(chan ccsock.Receipt, 16)
 	if *waitReceipt > 0 {
 		var err error
-		inbox, err = ccsock.Listen()
+		inbox, err = ccsock.Listen(ccsock.InboxConfig{
+			OnReceipt: func(r ccsock.Receipt) {
+				select {
+				case receipts <- r:
+				default:
+					fmt.Fprintln(os.Stderr, "receipt dropped: receiver is behind")
+				}
+			},
+		})
 		if err != nil {
 			return err
 		}
 		defer inbox.Close()
-		inbox.OnReceipt = func(r ccsock.Receipt) { receipts <- r }
 		msg.From = inbox.Address()
 		fmt.Fprintf(os.Stderr, "listening for receipts on %s\n", inbox.Address())
 	}
@@ -209,12 +268,16 @@ func sendCmd(args []string) error {
 			select {
 			case r := <-receipts:
 				fmt.Fprintf(os.Stderr, "receipt: %s (msg %s) %s\n", r.Status, r.OrigMsgID, r.Reason)
-				if r.Status != ccsock.StatusHeld {
+				switch r.Status {
+				case ccsock.StatusHeld:
+					continue
+				case ccsock.StatusDenied, ccsock.StatusExpired:
+					return &exitError{code: 2, err: fmt.Errorf("message was %s", r.Status)}
+				default:
 					return nil
 				}
 			case <-deadline:
-				fmt.Fprintln(os.Stderr, "no further receipts")
-				return nil
+				return &exitError{code: 3, err: errors.New("timed out waiting for a receipt")}
 			}
 		}
 	}
@@ -233,24 +296,24 @@ func renameCmd(args []string) error {
 		return errors.New("no new name given")
 	}
 
-	var socket string
 	switch {
 	case *pid != 0:
 		s, err := ccsock.FindByPID(*pid)
 		if err != nil {
 			return err
 		}
-		socket = s.SocketPath
+		// RenameSession stamps the session ID, so a stale registry entry
+		// cannot rename whatever now listens on that path.
+		return ccsock.New().RenameSession(context.Background(), s, newName)
 	case *to != "":
 		p, err := ccsock.ParseAddress(*to)
 		if err != nil {
 			return err
 		}
-		socket = p
+		return ccsock.New().Rename(context.Background(), p, newName)
 	default:
 		return errors.New("pick a target with --pid or --to")
 	}
-	return ccsock.New().Rename(context.Background(), socket, newName)
 }
 
 func selfCmd() error {
