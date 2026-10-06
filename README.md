@@ -220,6 +220,33 @@ ran:
 | 2 | The receiving session denied the message, or a held message expired |
 | 3 | `--wait-receipt` elapsed with no terminal receipt |
 
+### Correlated replies and verified peers
+
+The additional [`claude-socket` CLI](cmd/claude-socket/README.md) sends one
+request to an existing session and waits for a correlated reply. It verifies
+kernel peer identity in both directions, serializes its requests per session,
+and reports receipt states separately from replies as newline-delimited JSON.
+It always sends as an external peer without looking up authentication tokens.
+
+```sh
+go install github.com/PeterSR/claude-code-socket-transport/cmd/claude-socket@latest
+claude-socket list
+claude-socket ask --session UUID --text 'What is the current status?'
+# From a source checkout, scripts/claude-socket builds a cached local binary.
+```
+
+This command requires macOS or Linux. It never changes Claude's inbound policy
+or tool permissions, retries requests, or starts a Claude session. A timeout
+can leave accepted work running. See its [exit contract and tests](cmd/claude-socket/README.md).
+
+Library callers can opt into `Client.ExpectedPID` and `InboxConfig.ExpectedPID`
+to verify kernel peer identity; verification fails on unsupported platforms.
+`InboxConfig.Directory` selects the target's socket namespace. Inbox paths are
+unique per listener, and `Close` waits for existing callbacks and connections;
+callbacks must be short and must not call `Close` themselves.
+`errors.Is(err, ccsock.ErrNotSent)` identifies failures before a frame write was
+attempted. Other send errors can leave delivery uncertain.
+
 ## The protocol
 
 Everything below is reverse-engineered from the Claude Code binary (v2.1.233)
@@ -352,8 +379,8 @@ a different sender.
 
 - **Reach sessions on other machines or on the web.** Those go through
   Anthropic's servers over Remote Control. This package is local sockets only.
-- **Read a conversation.** The socket is write-only from a peer's side. Nothing
-  comes back except delivery receipts.
+- **Read conversation history.** A peer can collect delivery receipts and
+  messages explicitly sent back by Claude, but cannot retrieve its transcript.
 - **Bypass the receiver's controls.** `crossSessionInbound` and the
   permission-mode defaults apply to everything you send. A session set to
   `refuse` silently drops your message and reports nothing.

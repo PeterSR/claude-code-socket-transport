@@ -1,3 +1,5 @@
 /cc-send
 /dist/
 *.tmp
+/claude-socket
+/bin/

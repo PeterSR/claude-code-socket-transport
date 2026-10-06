@@ -41,8 +41,3 @@ func openNoFollow(path string) (*os.File, error) {
 func checkSocketDirOwnership(dir string, fi os.FileInfo) error {
 	return fmt.Errorf("ccsock: binding an inbox is not supported on Windows: %s's ownership cannot be verified; sending is unaffected", dir)
 }
-
-// withTightUmask just calls fn: Windows has no umask.
-func withTightUmask(fn func() error) error {
-	return fn()
-}

@@ -179,8 +179,8 @@ const envelopeTag = "cross-session-message"
 // quoting, matching the receiver's own parse.
 var fromNameRe = regexp.MustCompile(`["<>\n\r]`)
 
-// maxFromName is the length Claude Code truncates a sender name to.
-const maxFromName = 200
+// Limit names to 64 UTF-8 bytes, conservatively within current Claude limits.
+const maxFromName = 64
 
 // wrapEnvelope builds the attribution envelope. The receiver re-serializes what
 // it parses and compares it against the original, so attribute order and
@@ -199,21 +199,14 @@ func wrapEnvelope(from, name, body string) string {
 func sanitizeName(name string) string {
 	name = fromNameRe.ReplaceAllString(name, "")
 	name = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Cs, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
 			return -1
 		}
 		return r
 	}, name)
 	name = strings.TrimSpace(name)
 	if len(name) > maxFromName {
-		// Cut on a rune boundary: name[:maxFromName] is a raw byte slice and
-		// can land inside a multi-byte rune, which makes json.Marshal emit
-		// U+FFFD on the wire. Keep the limit in bytes rather than runes:
-		// Claude Code truncates at 200 UTF-16 code units, and a UTF-8 byte
-		// count is always >= the UTF-16 unit count for the same text, so a
-		// 200-byte cut can only ever be more aggressive than the receiver's
-		// own truncation, which its envelope round-trip comparison tolerates.
-		// Cutting less would not.
+		// Preserve UTF-8 while applying the conservative byte limit.
 		cut := maxFromName
 		for cut > 0 && !utf8.RuneStart(name[cut]) {
 			cut--

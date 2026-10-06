@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sync"
 	"syscall"
 )
 
@@ -23,7 +22,7 @@ func processAlive(pid int) bool {
 // openNoFollow opens path without following a symlink, so a path swapped for
 // a symlink between the caller's check and its read cannot be followed.
 func openNoFollow(path string) (*os.File, error) {
-	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 }
 
 // checkSocketDirOwnership verifies dir is owned by us and not group or world
@@ -41,20 +40,4 @@ func checkSocketDirOwnership(dir string, fi os.FileInfo) error {
 		return fmt.Errorf("ccsock: %s has mode %s: group or world accessible", dir, fi.Mode().Perm())
 	}
 	return nil
-}
-
-// umaskMu guards the umask changes withTightUmask makes. Umask is
-// process-global, so concurrent binds elsewhere in the process must not stomp
-// on each other's setting.
-var umaskMu sync.Mutex
-
-// withTightUmask tightens the umask for the duration of fn, then restores it,
-// so a file fn creates cannot exist in a world-writable state even for an
-// instant.
-func withTightUmask(fn func() error) error {
-	umaskMu.Lock()
-	defer umaskMu.Unlock()
-	old := syscall.Umask(0o177)
-	defer syscall.Umask(old)
-	return fn()
 }

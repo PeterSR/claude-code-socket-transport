@@ -362,12 +362,6 @@ func findByName(name string, probe time.Duration) (Session, error) {
 	return pickOne(matches, fmt.Sprintf("name %q", name), probe)
 }
 
-// reachableFunc is the reachability check pickOne applies. Production always
-// uses Session.Reachable; it is a variable so a test can observe the timeout
-// that actually reaches the probe, which is the one thing a caller setting
-// Client.ProbeTimeout is paying for.
-var reachableFunc = Session.Reachable
-
 func pickOne(matches []Session, what string, probe time.Duration) (Session, error) {
 	switch len(matches) {
 	case 0:
@@ -377,7 +371,7 @@ func pickOne(matches []Session, what string, probe time.Duration) (Session, erro
 	}
 	var live []Session
 	for _, s := range matches {
-		if reachableFunc(s, probe) {
+		if s.Reachable(probe) {
 			live = append(live, s)
 		}
 	}

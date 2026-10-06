@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source_dir="$repo_dir"
+binary="$source_dir/bin/claude-socket"
+rebuild=0
+[[ -x "$binary" ]] || rebuild=1
+for source in "$source_dir"/*.go "$source_dir/go.mod" "$source_dir"/cmd/claude-socket/*.go; do
+  [[ "$source" -nt "$binary" ]] && rebuild=1
+done
+if [[ "$rebuild" == 1 ]]; then
+  mkdir -p -- "$source_dir/bin"
+  build_dir="$(mktemp -d "$source_dir/bin/.build.XXXXXX")"
+  trap 'rm -rf -- "$build_dir"' EXIT
+  go -C "$source_dir" build -trimpath -o "$build_dir/claude-socket" ./cmd/claude-socket
+  mv -f -- "$build_dir/claude-socket" "$binary"
+  rmdir -- "$build_dir"
+  trap - EXIT
+fi
+exec "$binary" "$@"

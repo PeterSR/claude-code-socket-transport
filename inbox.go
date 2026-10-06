@@ -11,39 +11,27 @@ import (
 	"time"
 )
 
-// inboxIdleTimeout bounds how long a connection may sit without sending a
-// full line. Without it, a local process that opens a connection and never
-// writes would pin a goroutine and a file descriptor forever.
 const inboxIdleTimeout = 30 * time.Second
+const maxInboxConnections = 16
 
-// ReceiptStatus is the outcome a receiving session reports back to a sender.
 type ReceiptStatus string
 
 const (
-	// StatusHeld means the message is waiting for the receiving user's
-	// approval. A second receipt follows when they decide.
-	StatusHeld ReceiptStatus = "held"
-	// StatusDenied means the receiving user declined the message.
-	StatusDenied ReceiptStatus = "denied"
-	// StatusExpired means a held message timed out unapproved.
-	StatusExpired ReceiptStatus = "expired"
-	// StatusDelivered means a previously held message was released to Claude.
+	StatusHeld      ReceiptStatus = "held"
+	StatusDenied    ReceiptStatus = "denied"
+	StatusExpired   ReceiptStatus = "expired"
 	StatusDelivered ReceiptStatus = "delivered"
+	StatusRefused   ReceiptStatus = "refused"
+	StatusDropped   ReceiptStatus = "dropped"
 )
 
-// Receipt is a delivery outcome for a message this process sent.
 type Receipt struct {
-	// Status is the outcome.
-	Status ReceiptStatus
-	// OrigMsgID is the ID returned by the Send call this receipt answers.
+	Status    ReceiptStatus
 	OrigMsgID string
-	// From is the reporting session's reply address.
-	From string
-	// Reason is the human-readable explanation the session included.
-	Reason string
+	From      string
+	Reason    string
 }
 
-// incomingFrame is the subset of the wire format an Inbox decodes.
 type incomingFrame struct {
 	Type      string        `json:"type"`
 	Action    string        `json:"action"`
@@ -57,179 +45,127 @@ type incomingFrame struct {
 	} `json:"message"`
 }
 
-// InboxConfig configures the callbacks an Inbox invokes as frames arrive. It
-// is consumed by Listen before the accept loop starts, so there is no window
-// in which a frame can arrive before the callbacks are wired up.
+// Callbacks run concurrently and must be short; they must not call Close.
+// Directory should be the resolved target's socket directory, not its caller's
+// TMPDIR. ExpectedPID checks kernel peer credentials, not a claimed JSON field.
 type InboxConfig struct {
-	// OnReceipt is called for each delivery receipt. It runs on the
-	// connection's goroutine, so keep it short.
-	OnReceipt func(Receipt)
-	// OnMessage is called when a peer sends this inbox a user message.
-	// Optional.
-	OnMessage func(text, from string)
+	Directory   string
+	ExpectedPID int
+	OnReceipt   func(Receipt)
+	OnMessage   func(text, from string)
 }
 
-// Inbox binds a socket that speaks the receiving half of the protocol, so a Go
-// program can collect the delivery receipts its own sends generate.
-//
-// It is optional: sending works without one. Without an inbox there is no
-// address to put in Message.From, so a session has nowhere to report that it
-// held, denied, or later delivered your message.
-//
-// An Inbox is not a Claude Code session. It binds beside the real sockets so
-// receipts are routed to it, but it does not register itself in the session
-// registry and will not appear in another session's agent list.
 type Inbox struct {
-	onReceipt func(Receipt)
-	onMessage func(text, from string)
-
-	listener net.Listener
-	path     string
-	mu       sync.Mutex
-	closed   bool
+	cfg         InboxConfig
+	listener    net.Listener
+	path        string
+	mu          sync.Mutex
+	closed      bool
+	connections map[net.Conn]struct{}
+	workers     sync.WaitGroup
+	acceptDone  chan struct{}
+	closeOnce   sync.Once
+	closeErr    error
 }
 
-// Listen binds an inbox socket in the same directory as the session sockets, so
-// receipts pass the receiving session's check that a reply address sits inside
-// its own socket namespace. A socket bound elsewhere is refused.
-//
-// Listen fails rather than binding when that directory is not a directory we
-// own with no group or world access, since anything else lets another local
-// user replace the socket and forge receipts.
-//
-// The returned Inbox must be closed; Close removes the socket file.
 func Listen(cfg InboxConfig) (*Inbox, error) {
-	// DefaultSocketPath applies the same 103-byte sun_path fallback Claude
-	// Code itself uses, so our bind directory matches what a receiving
-	// session actually checks against.
-	path := DefaultSocketPath(os.Getpid())
-	dir := filepath.Dir(path)
+	dir := cfg.Directory
+	if dir == "" {
+		dir = filepath.Dir(DefaultSocketPath(os.Getpid()))
+	}
 	if err := ensureSocketDir(dir); err != nil {
 		return nil, err
 	}
-
-	// A previous process with this PID may have left a socket behind. Only
-	// clear it when nothing is listening.
-	if Probe(path, defaultProbeTimeout) {
-		return nil, fmt.Errorf("ccsock: %s is already live", path)
+	id, err := newUUID()
+	if err != nil {
+		return nil, err
 	}
-	_ = os.Remove(path)
-
-	// net.Listen creates the socket file honoring the process umask, which is
-	// typically 0755: briefly connectable by any local user before the Chmod
-	// below runs. withTightUmask tightens the umask for the duration of the
-	// call so the file never exists in a world-writable state, even for an
-	// instant.
-	var l net.Listener
-	if err := withTightUmask(func() error {
-		var lErr error
-		l, lErr = net.Listen("unix", path)
-		return lErr
-	}); err != nil {
-		return nil, fmt.Errorf("ccsock: binding %s: %w", path, err)
+	path := filepath.Join(dir, fmt.Sprintf("%d-%s.sock", os.Getpid(), id[:8]))
+	if len(path) > maxSocketPathBytes {
+		return nil, fmt.Errorf("reply socket path exceeds %d bytes", maxSocketPathBytes)
 	}
-	// Belt and braces: restrict the mode explicitly too, in case the umask
-	// above did not cover every path net.Listen takes to create the file.
-	if err := os.Chmod(path, 0o600); err != nil {
-		_ = l.Close()
-		return nil, fmt.Errorf("ccsock: restricting %s: %w", path, err)
+	// The checked 0700 parent prevents exposure while the socket is chmodded.
+	// Never remove an existing pathname or change the process-global umask.
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
 	}
-
-	in := &Inbox{
-		listener:  l,
-		path:      path,
-		onReceipt: cfg.OnReceipt,
-		onMessage: cfg.OnMessage,
+	if err = os.Chmod(path, 0600); err != nil {
+		l.Close()
+		return nil, err
 	}
+	in := &Inbox{cfg: cfg, listener: l, path: path, connections: make(map[net.Conn]struct{}), acceptDone: make(chan struct{})}
 	go in.serve()
 	return in, nil
 }
-
-// Path returns the bound socket path.
-func (in *Inbox) Path() string { return in.path }
-
-// Address returns the "uds:" address to put in Message.From.
+func (in *Inbox) Path() string    { return in.path }
 func (in *Inbox) Address() string { return Address(in.path) }
 
-// Close stops accepting and removes the socket file.
+// Close waits for callbacks and closes only this inbox's accepted connections.
+// It never controls or terminates the Claude process.
 func (in *Inbox) Close() error {
-	in.mu.Lock()
-	if in.closed {
+	in.closeOnce.Do(func() {
+		in.mu.Lock()
+		in.closed = true
+		in.closeErr = in.listener.Close()
+		for conn := range in.connections {
+			conn.Close()
+		}
 		in.mu.Unlock()
-		return nil
-	}
-	in.closed = true
-	in.mu.Unlock()
-
-	err := in.listener.Close()
-	_ = os.Remove(in.path)
-	return err
+		<-in.acceptDone
+		in.workers.Wait()
+	})
+	return in.closeErr
 }
-
 func (in *Inbox) serve() {
-	// Mirrors the backoff net/http.Server.Serve uses around Accept: a
-	// transient error such as EMFILE under fd exhaustion would otherwise spin
-	// this goroutine at 100% CPU retrying immediately.
-	var retryDelay time.Duration
+	defer close(in.acceptDone)
 	for {
 		conn, err := in.listener.Accept()
 		if err != nil {
-			in.mu.Lock()
-			closed := in.closed
+			return
+		}
+		in.mu.Lock()
+		if in.closed || len(in.connections) >= maxInboxConnections {
 			in.mu.Unlock()
-			if closed {
-				return
-			}
-			if retryDelay == 0 {
-				retryDelay = 5 * time.Millisecond
-			} else {
-				retryDelay *= 2
-			}
-			if retryDelay > time.Second {
-				retryDelay = time.Second
-			}
-			time.Sleep(retryDelay)
+			conn.Close()
 			continue
 		}
-		retryDelay = 0
+		in.connections[conn] = struct{}{}
+		in.workers.Add(1)
+		in.mu.Unlock()
 		go in.handle(conn)
 	}
 }
-
 func (in *Inbox) handle(conn net.Conn) {
-	defer conn.Close()
-
-	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 0, 64*1024), maxFrameBytes)
-	for {
-		// Refresh the deadline before every read, not just once at connect
-		// time, so a peer that opens a connection and never writes cannot pin
-		// this goroutine and its fd forever.
-		_ = conn.SetReadDeadline(time.Now().Add(inboxIdleTimeout))
-		if !scanner.Scan() {
-			break
+	defer func() { conn.Close(); in.mu.Lock(); delete(in.connections, conn); in.mu.Unlock(); in.workers.Done() }()
+	if in.cfg.ExpectedPID > 0 {
+		if err := VerifyPeerPID(conn, in.cfg.ExpectedPID); err != nil {
+			return
 		}
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
+	}
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 0, 4096), maxFrameBytes)
+	// One absolute deadline also bounds peers that drip bytes indefinitely.
+	conn.SetReadDeadline(time.Now().Add(inboxIdleTimeout))
+	for scanner.Scan() {
+		in.mu.Lock()
+		closed := in.closed
+		in.mu.Unlock()
+		if closed {
+			return
 		}
 		var f incomingFrame
-		if err := json.Unmarshal(line, &f); err != nil {
+		if json.Unmarshal(scanner.Bytes(), &f) != nil {
 			continue
 		}
 		switch {
 		case f.Type == "control" && f.Action == "peer_message_status":
-			if in.onReceipt != nil {
-				in.onReceipt(Receipt{
-					Status:    f.Status,
-					OrigMsgID: f.OrigMsgID,
-					From:      f.From,
-					Reason:    f.Reason,
-				})
+			if in.cfg.OnReceipt != nil {
+				in.cfg.OnReceipt(Receipt{f.Status, f.OrigMsgID, f.From, f.Reason})
 			}
-		case f.Type == "user" && f.Message != nil:
-			if in.onMessage != nil {
-				in.onMessage(f.Message.Content, f.From)
+		case f.Type == "user" && f.Message != nil && f.Message.Role == "user":
+			if in.cfg.OnMessage != nil {
+				in.cfg.OnMessage(f.Message.Content, f.From)
 			}
 		}
 	}

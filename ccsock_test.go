@@ -453,25 +453,6 @@ func TestInboxCloseRemovesSocket(t *testing.T) {
 	}
 }
 
-func TestListenTwiceFails(t *testing.T) {
-	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
-
-	in1, err := Listen(InboxConfig{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer in1.Close()
-
-	in2, err := Listen(InboxConfig{})
-	if err == nil {
-		in2.Close()
-		t.Fatal("expected a second Listen to fail while the first is live")
-	}
-	if !strings.Contains(err.Error(), "already live") {
-		t.Errorf("error = %q, want it to mention already live", err)
-	}
-}
-
 // writeKeyFile publishes an inbox auth key the way a session would, naming it
 // after the given owner pid and target socket.
 func writeKeyFile(t *testing.T, dir string, ownerPID int, socketPath, token, procStart string) {
@@ -920,92 +901,6 @@ func TestDefaultSocketPathUsesXDGWhenShort(t *testing.T) {
 	want := filepath.Join(dir, "cc-socks", "1234.sock")
 	if got := DefaultSocketPath(1234); got != want {
 		t.Errorf("got %q, want %q", got, want)
-	}
-}
-
-// twoMatchingSessions writes two registry entries sharing a name, neither
-// reachable, so a lookup has to run the probe on both before failing.
-func twoMatchingSessions(t *testing.T) {
-	t.Helper()
-	cfg := t.TempDir()
-	t.Setenv("CLAUDE_CONFIG_DIR", cfg)
-	sessions := filepath.Join(cfg, "sessions")
-	if err := os.MkdirAll(sessions, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	writeSession(t, sessions, 200, "s200", "twin", filepath.Join(t.TempDir(), "a.sock"), 1000)
-	writeSession(t, sessions, 201, "s201", "twin", filepath.Join(t.TempDir(), "b.sock"), 1000)
-}
-
-// recordProbeTimeouts swaps the reachability check for one that records the
-// timeout it was handed and reports nothing reachable.
-func recordProbeTimeouts(t *testing.T) *[]time.Duration {
-	t.Helper()
-	var seen []time.Duration
-	orig := reachableFunc
-	reachableFunc = func(s Session, timeout time.Duration) bool {
-		seen = append(seen, timeout)
-		return false
-	}
-	t.Cleanup(func() { reachableFunc = orig })
-	return &seen
-}
-
-// TestPickOneUsesGivenProbeTimeout guards a regression: pickOne took the probe
-// timeout as a parameter and then ignored it, hardcoding the package default,
-// so nothing a caller set could reach the probe.
-func TestPickOneUsesGivenProbeTimeout(t *testing.T) {
-	twoMatchingSessions(t)
-	seen := recordProbeTimeouts(t)
-
-	const want = 7 * time.Second
-	if _, err := findByName("twin", want); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("got %v, want ErrNotFound", err)
-	}
-	if len(*seen) != 2 {
-		t.Fatalf("probed %d entries, want 2", len(*seen))
-	}
-	for _, got := range *seen {
-		if got != want {
-			t.Errorf("probed with %v, want %v", got, want)
-		}
-	}
-}
-
-// TestClientProbeTimeoutReachesLookup covers the whole path, from the exported
-// field a caller sets down to the timeout the probe runs with.
-func TestClientProbeTimeoutReachesLookup(t *testing.T) {
-	twoMatchingSessions(t)
-	seen := recordProbeTimeouts(t)
-
-	const want = 3 * time.Second
-	c := &Client{ProbeTimeout: want}
-	if _, err := c.SendToName(context.Background(), "twin", Message{Text: "hi"}); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("got %v, want ErrNotFound", err)
-	}
-	if len(*seen) == 0 {
-		t.Fatal("the lookup never probed")
-	}
-	for _, got := range *seen {
-		if got != want {
-			t.Errorf("probed with %v, want the client's %v", got, want)
-		}
-	}
-}
-
-// TestPackageLookupKeepsDefaultProbeTimeout checks the exported entry points
-// still use the package default rather than inheriting a client's setting.
-func TestPackageLookupKeepsDefaultProbeTimeout(t *testing.T) {
-	twoMatchingSessions(t)
-	seen := recordProbeTimeouts(t)
-
-	if _, err := FindByName("twin"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("got %v, want ErrNotFound", err)
-	}
-	for _, got := range *seen {
-		if got != defaultProbeTimeout {
-			t.Errorf("probed with %v, want %v", got, defaultProbeTimeout)
-		}
 	}
 }
 

@@ -24,6 +24,9 @@ const (
 // Client sends frames to session inboxes. The zero value is usable; New
 // returns one with the defaults spelled out.
 type Client struct {
+	// ExpectedPID verifies the kernel identity of the recipient after connecting.
+	ExpectedPID int
+
 	// Timeout bounds a single send, from dial to the receiver closing the
 	// connection. Zero means 5s.
 	Timeout time.Duration
@@ -44,6 +47,10 @@ type Client struct {
 
 // New returns a Client with default timeouts.
 func New() *Client { return &Client{} }
+
+// ErrNotSent means the send failed before any frame write was attempted.
+// Other errors leave delivery uncertain and must not trigger automatic retries.
+var ErrNotSent = errors.New("ccsock: message not sent")
 
 var defaultClient = &Client{}
 
@@ -69,7 +76,7 @@ func (c *Client) probeTimeout() time.Duration {
 // which correlates with the receipts delivered to Message.From.
 func (c *Client) Send(ctx context.Context, s Session, m Message) (string, error) {
 	if s.SocketPath == "" {
-		return "", fmt.Errorf("ccsock: session %d has no inbox socket", s.PID)
+		return "", fmt.Errorf("%w: session %d has no inbox socket", ErrNotSent, s.PID)
 	}
 	if m.SessionID == "" {
 		m.SessionID = s.SessionID
@@ -129,7 +136,7 @@ func (c *Client) SendToAddress(ctx context.Context, addr string, m Message) (str
 func (c *Client) SendToSocket(ctx context.Context, socketPath string, m Message) (string, error) {
 	frame, err := m.frame()
 	if err != nil {
-		return "", err
+		return "", errors.Join(ErrNotSent, err)
 	}
 	if err := c.writeFrame(ctx, socketPath, frame); err != nil {
 		return "", err
@@ -175,7 +182,13 @@ func (c *Client) rename(ctx context.Context, socketPath, sessionID, name string)
 
 // writeFrame opens the socket, writes the optional auth line followed by one
 // JSON line, and half-closes so the receiver sees the end of the stream.
-func (c *Client) writeFrame(ctx context.Context, socketPath string, frame any) error {
+func (c *Client) writeFrame(ctx context.Context, socketPath string, frame any) (result error) {
+	writeStarted := false
+	defer func() {
+		if result != nil && !writeStarted {
+			result = errors.Join(ErrNotSent, result)
+		}
+	}()
 	payload, err := json.Marshal(frame)
 	if err != nil {
 		return fmt.Errorf("ccsock: encoding frame: %w", err)
@@ -208,10 +221,18 @@ func (c *Client) writeFrame(ctx context.Context, socketPath string, frame any) e
 		return fmt.Errorf("ccsock: connecting to %s: %w", socketPath, err)
 	}
 	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
+	if c.ExpectedPID > 0 {
+		if err := VerifyPeerPID(conn, c.ExpectedPID); err != nil {
+			return err
+		}
+	}
 
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
+	writeStarted = true
 	if _, err := conn.Write(line); err != nil {
 		return fmt.Errorf("ccsock: writing to %s: %w", socketPath, err)
 	}
@@ -235,10 +256,12 @@ func (c *Client) writeFrame(ctx context.Context, socketPath string, frame any) e
 		return fmt.Errorf("ccsock: half-closing %s: %w", socketPath, err)
 	}
 
-	// The receiver closes once it has taken the frame. Waiting for that turns
-	// a rejected connection, such as one dropped for a bad auth frame, into a
-	// timeout rather than a silent success.
-	if _, err := io.Copy(io.Discard, conn); err != nil && !errors.Is(err, net.ErrClosed) {
+	// EOF proves only transport completion, never authentication or delivery.
+	_, readErr := io.Copy(io.Discard, conn)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err := readErr; err != nil && !errors.Is(err, net.ErrClosed) {
 		return fmt.Errorf("ccsock: waiting for %s to close: %w", socketPath, err)
 	}
 	return nil
