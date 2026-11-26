@@ -186,6 +186,32 @@ For the same reason, `Listen` refuses to bind at all when that directory is not
 one we own with no group or world access, since anything looser would let
 another local user replace the socket and forge receipts.
 
+### Show your own agents in ListAgents
+
+Package `shim` goes the other way: it makes an agent that is not a Claude
+Code session show up in every session's native ListAgents, under its own
+name, and lets those sessions message it with their native SendMessage. Each
+agent gets a small child process (a shim) that binds a socket and registers
+itself as a session would; a `Pool` keeps one running per agent and hands
+you what sessions send them.
+
+```go
+pool, _ := shim.NewPool(shim.Options{
+    Args:      func(name, cwd string) []string { return []string{"shim", name, cwd} },
+    OnMessage: func(m shim.Inbound) { log.Printf("%s got %q from %s", m.Shim, m.Body, m.FromName) },
+})
+pool.Reconcile([]shim.Spec{{Name: "build-bot", CWD: "/srv/ci", Status: "idle"}})
+```
+
+Your program also runs the shims: when started with the arguments `Args`
+builds, it must call `shim.Run` before anything else. A `Spec` can carry the
+agent's status and start time, which ListAgents shows, and a Remote Control
+id, which makes Claude Code show the shim in place of that session's Remote
+Control row. `Options.Max` caps the number of shims (zero means no cap), and
+`shim.Sweep`, called at startup, removes registry entries left by the shims of
+an owner that was killed. `ParseEnvelope` unwraps the envelope around a message
+received from a session's native SendMessage.
+
 ### CLI
 
 `cmd/cc-send` exercises the library from a shell.
